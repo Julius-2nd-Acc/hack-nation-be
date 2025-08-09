@@ -1,0 +1,8 @@
+flask
+langchain
+langchain-openai
+openai
+tiktoken
+langchainhub
+requests
+pytz
