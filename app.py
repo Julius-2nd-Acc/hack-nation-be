@@ -111,43 +111,65 @@ class SQLiteTracer(BaseCallbackHandler):
 
 @tool
 def web_search(query: str, num_results: int = 5) -> str:
-    """Search the web for information using DuckDuckGo. Returns search results."""
+    """Search the web for information using multiple free sources."""
     try:
-        import requests
         from urllib.parse import quote
         
-        # Using DuckDuckGo Instant Answer API
-        url = f"https://api.duckduckgo.com/?q={quote(query)}&format=json&no_html=1&skip_disambig=1"
-        response = requests.get(url, timeout=10)
-        data = response.json()
+        # Method 1: Try DuckDuckGo instant answers
+        ddg_url = f"https://api.duckduckgo.com/?q={quote(query)}&format=json&no_html=1&skip_disambig=1"
         
-        results = []
-        if data.get('Abstract'):
-            results.append(f"Summary: {data['Abstract']}")
+        response = requests.get(ddg_url, timeout=10, headers={
+            'User-Agent': 'Mozilla/5.0 (compatible; AI Agent/1.0)'
+        })
         
-        if data.get('RelatedTopics'):
-            for topic in data['RelatedTopics'][:num_results]:
-                if isinstance(topic, dict) and topic.get('Text'):
-                    results.append(f"• {topic['Text']}")
+        if response.status_code == 200:
+            data = response.json()
+            results = []
+            
+            if data.get('Abstract'):
+                results.append(f"Summary: {data['Abstract']}")
+            
+            if data.get('RelatedTopics'):
+                for topic in data['RelatedTopics'][:num_results]:
+                    if isinstance(topic, dict) and topic.get('Text'):
+                        results.append(f"• {topic['Text']}")
+            
+            if results:
+                return "\n".join(results)
         
-        return "\n".join(results) if results else f"No detailed results found for '{query}'. Try a more specific search."
+        # Method 2: Fallback to Wikipedia search
+        wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(query)}"
+        wiki_response = requests.get(wiki_url, timeout=10)
+        
+        if wiki_response.status_code == 200:
+            wiki_data = wiki_response.json()
+            if wiki_data.get('extract'):
+                return f"Wikipedia Summary: {wiki_data['extract']}"
+        
+        return f"Limited search results available for '{query}'. Try a more specific query."
+        
     except Exception as e:
-        return f"Error searching web: {str(e)}"
+        return f"Search unavailable: {str(e)}"
 
 @tool
 def get_current_time(timezone: str = "UTC") -> str:
     """Get current time in specified timezone (e.g., 'UTC', 'US/Eastern', 'Europe/London')."""
     try:
-        import pytz
-        if timezone.upper() == "UTC":
-            tz = pytz.UTC
-        else:
-            tz = pytz.timezone(timezone)
-        current_time = datetime.now(tz)
-        return f"Current time in {timezone}: {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-    except:
-        # Fallback to basic time
-        return f"Current UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        # Try with pytz if available
+        try:
+            import pytz
+            if timezone.upper() == "UTC":
+                tz = pytz.UTC
+            else:
+                tz = pytz.timezone(timezone)
+            current_time = datetime.now(tz)
+            return f"Current time in {timezone}: {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+        except ImportError:
+            # Fallback without pytz
+            current_time = datetime.utcnow()
+            return f"Current UTC time: {current_time.strftime('%Y-%m-%d %H:%M:%S UTC')} (pytz not available for timezone conversion)"
+    except Exception as e:
+        return f"Time error: {str(e)}"
 
 @tool
 def calculate_math(expression: str) -> str:
@@ -358,7 +380,63 @@ def json_processor(json_data: str, operation: str = "format") -> str:
     except Exception as e:
         return f"JSON processing error: {str(e)}"
 
-def run_agent(session_id: str, prompt: str):
+def get_conversation_history(session_id: str) -> str:
+    """Reconstruct conversation history from traces"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Get session initial prompt
+    cursor.execute('SELECT initial_prompt FROM sessions WHERE session_id = ?', (session_id,))
+    session_row = cursor.fetchone()
+    initial_prompt = session_row[0] if session_row else ""
+    
+    # Get all traces for this session
+    cursor.execute('''
+        SELECT event, data, timestamp
+        FROM traces 
+        WHERE session_id = ?
+        ORDER BY timestamp
+    ''', (session_id,))
+    trace_rows = cursor.fetchall()
+    conn.close()
+    
+    # Reconstruct conversation
+    conversation_history = f"Previous conversation history for session {session_id}:\n\n"
+    conversation_history += f"Initial request: {initial_prompt}\n\n"
+    
+    # Track conversation flow
+    current_input = None
+    responses = []
+    
+    for event, data_str, timestamp in trace_rows:
+        try:
+            data = json.loads(data_str)
+            event_type = data.get("event", "")
+            
+            # Track chain starts (user inputs)
+            if event_type == "chain_start":
+                inputs = data.get("inputs", {})
+                if isinstance(inputs, dict) and "input" in inputs:
+                    current_input = inputs["input"]
+            
+            # Track final outputs
+            elif event_type == "chain_end":
+                outputs = data.get("outputs", {})
+                if isinstance(outputs, dict) and "output" in outputs:
+                    if current_input:
+                        responses.append(f"Human: {current_input}")
+                        responses.append(f"Assistant: {outputs['output']}")
+                        current_input = None
+                    
+        except (json.JSONDecodeError, KeyError):
+            continue
+    
+    if responses:
+        conversation_history += "Previous exchanges:\n" + "\n\n".join(responses) + "\n\n"
+    
+    return conversation_history
+
+def run_agent(session_id: str, prompt: str, conversation_history: str = ""):
     """Run the agent in a separate thread"""
     try:
         # Update session status to running
@@ -403,8 +481,14 @@ def run_agent(session_id: str, prompt: str):
         agent = create_react_agent(llm, tools, prompt_template)
         executor = AgentExecutor(agent=agent, tools=tools, verbose=True, callbacks=[tracer])
         
+        # Prepare input with conversation history if available
+        if conversation_history:
+            full_input = f"{conversation_history}Current request: {prompt}"
+        else:
+            full_input = prompt
+        
         # Execute agent
-        result = executor.invoke({"input": prompt})
+        result = executor.invoke({"input": full_input})
         final_output = result.get("output", "")
         
         # Update session with final result
@@ -442,6 +526,7 @@ def chat():
     
     prompt = data['prompt']
     session_id = data.get('session_id')
+    conversation_history = ""
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -453,8 +538,9 @@ def chat():
             conn.close()
             return jsonify({"error": "Session not found"}), 404
         
-        # Add the new prompt as a follow-up (we could store this if needed)
-        # For now, just run the agent with the new prompt in the existing session
+        # Load conversation history for existing session
+        conn.close()
+        conversation_history = get_conversation_history(session_id)
     else:
         # Create new session
         session_id = str(uuid.uuid4())
@@ -463,11 +549,10 @@ def chat():
             VALUES (?, ?, 'pending')
         ''', (session_id, prompt))
         conn.commit()
+        conn.close()
     
-    conn.close()
-    
-    # Start agent execution in background thread
-    thread = threading.Thread(target=run_agent, args=(session_id, prompt))
+    # Start agent execution in background thread with conversation history
+    thread = threading.Thread(target=run_agent, args=(session_id, prompt, conversation_history))
     thread.daemon = True
     thread.start()
     
