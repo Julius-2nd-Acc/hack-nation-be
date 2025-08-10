@@ -8,6 +8,49 @@ from . import *
 DB_PATH = "agent_traces.db"
 
 def register_routes(app):
+
+	@app.route('/sessions/<session_id>/traces', methods=['GET'])
+	def get_session_traces(session_id):
+		conn = sqlite3.connect(DB_PATH)
+		cursor = conn.cursor()
+		# Get session info
+		cursor.execute('''
+			SELECT session_id, created_at, updated_at
+			FROM sessions WHERE session_id = ?
+		''', (session_id,))
+		session_row = cursor.fetchone()
+		if not session_row:
+			conn.close()
+			return jsonify({"error": "Session not found"}), 404
+		# Get all message_ids for this session
+		cursor.execute('''
+			SELECT message_id FROM messages WHERE session_id = ?
+		''', (session_id,))
+		message_ids = [row[0] for row in cursor.fetchall()]
+		# Get all traces for these message_ids
+		traces = []
+		for message_id in message_ids:
+			cursor.execute('''
+				SELECT event, data, timestamp FROM traces WHERE message_id = ? ORDER BY timestamp
+			''', (message_id,))
+			trace_rows = cursor.fetchall()
+			for event, data, timestamp in trace_rows:
+				try:
+					trace_data = json.loads(data)
+					traces.append(trace_data)
+				except json.JSONDecodeError:
+					traces.append({"event": event, "data": data, "timestamp": timestamp})
+		conn.close()
+		session_info = {
+			"session_id": session_row[0],
+			"created_at": session_row[1],
+			"updated_at": session_row[2]
+		}
+		return jsonify({
+			"session": session_info,
+			"traces": traces
+		})
+	
 	@app.route('/chat/new', methods=['POST'])
 	def chat():
 		data = request.get_json()
