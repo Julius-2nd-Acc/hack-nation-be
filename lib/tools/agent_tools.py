@@ -4,11 +4,11 @@ import json
 import math
 import statistics
 import re
-import pytz
 import tempfile
 import subprocess
 import requests
 from datetime import datetime
+import pytz
 from langchain.tools import tool
 
 # The following tools are imported and used in app.py
@@ -45,6 +45,7 @@ def web_search(query: str, num_results: int = 5) -> str:
 def get_current_time(timezone: str = "UTC") -> str:
 	"""Get current time in specified timezone (e.g., 'UTC', 'US/Eastern', 'Europe/London')."""
 	try:
+		timezone = timezone.strip().strip("'\"")
 
 		# Handle UTC offset like 'UTC+2', 'UTC-5', etc.
 		if timezone.upper().startswith("UTC") and len(timezone) > 3:
