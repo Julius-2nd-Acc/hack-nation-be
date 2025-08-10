@@ -26,6 +26,12 @@ from langchain.tools import tool
 from langchain.callbacks.base import BaseCallbackHandler
 from langchain.schema import HumanMessage, AIMessage, SystemMessage
 
+# Load environment variables
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Initialize Flask app and OpenAI client
 app = Flask(__name__)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -480,6 +486,9 @@ def chat():
     """
     data = request.get_json()
     
+    print("Received chat request:", data)
+    
+    # Validate request body
     if not data or 'messages' not in data:
         return jsonify({"error": "Missing 'messages' in request body"}), 400
     

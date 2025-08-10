@@ -7,3 +7,6 @@ langchainhub
 requests
 pytz
 openai
+python-dotenv // Access env variables
+
+pyngrok
