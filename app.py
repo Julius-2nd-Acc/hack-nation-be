@@ -76,10 +76,12 @@ def init_db():
     conn.close()
 
 class SQLiteTracer(BaseCallbackHandler):
-    """Tracer that stores events in SQLite database"""
+    """Tracer that stores events in SQLite database and limits tool usage"""
     
     def __init__(self, message_id: str):
         self.message_id = message_id
+        self.tool_usage_count = {}  # Track tool usage per tool name
+        self.max_tool_calls = 3  # Reduced from 5 to prevent endless loops
     
     def _write(self, record: Dict[str, Any]):
         """Write a trace record to the database"""
@@ -103,11 +105,63 @@ class SQLiteTracer(BaseCallbackHandler):
             content = response.generations[0][0].text
         except Exception:
             content = str(response)
-        self._write({"event":"llm_end","output":content})
+        
+        # Parse tool calls from ReAct format
+        tool_call = self._parse_tool_call(content)
+        self._write({"event":"llm_end","output":content,"tool_call":tool_call})
+    
+    def _parse_tool_call(self, content: str) -> Optional[Dict[str, Any]]:
+        """Parse tool call from ReAct format LLM output"""
+        try:
+            lines = content.strip().split('\n')
+            action_line = None
+            input_line = None
+            
+            for i, line in enumerate(lines):
+                if line.startswith('Action:'):
+                    action_line = line
+                    # Look for Action Input on next lines
+                    for j in range(i+1, min(i+3, len(lines))):
+                        if lines[j].startswith('Action Input:'):
+                            input_line = lines[j]
+                            break
+                    break
+            
+            if action_line:
+                tool_name = action_line.replace('Action:', '').strip()
+                tool_input = ""
+                
+                if input_line:
+                    tool_input = input_line.replace('Action Input:', '').strip()
+                    # Remove quotes if present
+                    if tool_input.startswith('"') and tool_input.endswith('"'):
+                        tool_input = tool_input[1:-1]
+                
+                return {
+                    "tool_name": tool_name,
+                    "tool_input": tool_input
+                }
+        except Exception:
+            pass
+        
+        return None
 
     # Tool events
     def on_tool_start(self, serialized, input_str, **kwargs):
-        self._write({"event":"tool_start","tool":serialized.get("name"),"input":input_str})
+        tool_name = serialized.get("name", "unknown_tool")
+        
+        # Check if tool has been called too many times
+        current_count = self.tool_usage_count.get(tool_name, 0)
+        if current_count >= self.max_tool_calls:
+            error_msg = f"STOP! Tool '{tool_name}' has been called {current_count} times. Maximum allowed is {self.max_tool_calls}. You must try a completely different approach now."
+            self._write({"event":"tool_limit_exceeded","tool":tool_name,"count":current_count,"limit":self.max_tool_calls})
+            # Force stop by raising a critical exception
+            raise RuntimeError(f"CRITICAL: Tool limit exceeded for {tool_name}. Agent must stop immediately.")
+        
+        # Increment usage count
+        self.tool_usage_count[tool_name] = current_count + 1
+        
+        self._write({"event":"tool_start","tool":tool_name,"input":input_str,"usage_count":self.tool_usage_count[tool_name]})
     
     def on_tool_end(self, output, **kwargs):
         self._write({"event":"tool_end","output":output})
@@ -173,27 +227,49 @@ def get_current_time(timezone: str = "UTC") -> str:
 
 @tool
 def calculate_math(expression: str) -> str:
-    """Safely evaluate mathematical expressions. Supports +, -, *, /, **, sqrt, sin, cos, etc."""
+    """Safely evaluate mathematical expressions. Supports +, -, *, /, **, sqrt, sin, cos, log, ln, etc.
+    Use 'ln(x)' for natural logarithm, 'log(x)' for base-10 logarithm.
+    
+    IMPORTANT: Provide ONLY the mathematical expression, NO comments or extra text."""
     try:
+        # Debug logging
+        print(f"DEBUG: Original expression: '{expression}'")
+        
+        # Clean the input - remove comments and extra text
+        cleaned_expression = expression.strip()
+        
+        # Remove comments (anything after #)
+        if '#' in cleaned_expression:
+            cleaned_expression = cleaned_expression.split('#')[0].strip()
+        
+        # Remove quotes if present (both single and double quotes)
+        if (cleaned_expression.startswith('"') and cleaned_expression.endswith('"')) or \
+           (cleaned_expression.startswith("'") and cleaned_expression.endswith("'")):
+            cleaned_expression = cleaned_expression[1:-1]
+        
+        print(f"DEBUG: Cleaned expression: '{cleaned_expression}'")
+        
         # Safe evaluation with math functions
         allowed_names = {
             k: v for k, v in math.__dict__.items() if not k.startswith("__")
         }
         allowed_names.update({
             "abs": abs, "round": round, "min": min, "max": max,
-            "sum": sum, "len": len, "pow": pow
+            "sum": sum, "len": len, "pow": pow,
+            "ln": math.log,  # Add natural logarithm as 'ln'
         })
         
         # Compile and evaluate safely
-        code = compile(expression, "<string>", "eval")
+        code = compile(cleaned_expression, "<string>", "eval")
         result = eval(code, {"__builtins__": {}}, allowed_names)
         return f"Result: {result}"
     except Exception as e:
-        return f"Math error: {str(e)}"
+        return f"Math error: {str(e)}. Available functions: +, -, *, /, **, sqrt, sin, cos, log, ln, abs, round, min, max, etc. Make sure to provide only the mathematical expression without comments."
 
 @tool
 def analyze_data(data_str: str, operation: str = "describe") -> str:
-    """Analyze numerical data. Operations: 'describe', 'mean', 'median', 'std', 'min', 'max'."""
+    """Analyze numerical data and return TEXT-BASED statistics only. Operations: 'describe', 'mean', 'median', 'std', 'min', 'max'. 
+    No visual charts or graphs - only text summaries and statistics."""
     try:
         # Parse numbers from string
         numbers = [float(x.strip()) for x in re.findall(r'-?\d+\.?\d*', data_str)]
@@ -258,22 +334,52 @@ def list_directory(path: str = ".") -> str:
 
 @tool
 def execute_python_code(code: str) -> str:
-    """Execute Python code safely and return the output. Use for complex calculations or data processing."""
+    """Execute Python code safely and return TEXT OUTPUT ONLY. 
+    
+    IMPORTANT INPUT FORMAT: Provide only the raw Python code, WITHOUT any markdown backticks or formatting.
+    
+    CORRECT: import math; print(math.sqrt(16))
+    WRONG: ```python\\nimport math\\nprint(math.sqrt(16))\\n```
+    
+    Use for calculations, data processing, and analysis. DO NOT use for plots/charts."""
     try:
+        # Clean up the input - remove common formatting issues
+        cleaned_code = code.strip()
+        
+        # Remove markdown code block formatting if present
+        if cleaned_code.startswith('```'):
+            lines = cleaned_code.split('\n')
+            # Remove first line if it's ```python or similar
+            if lines[0].startswith('```'):
+                lines = lines[1:]
+            # Remove last line if it's ```
+            if lines and lines[-1].strip() == '```':
+                lines = lines[:-1]
+            cleaned_code = '\n'.join(lines)
+        
+        # Add encoding declaration for international characters
+        if '# -*- coding:' not in cleaned_code:
+            cleaned_code = "# -*- coding: utf-8 -*-\n" + cleaned_code
+        
         # Create a temporary file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(code)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
+            f.write(cleaned_code)
             temp_file = f.name
         
         # Execute with timeout
         result = subprocess.run([
             'python', temp_file
-        ], capture_output=True, text=True, timeout=30)
+        ], capture_output=True, text=True, timeout=30, encoding='utf-8')
         
         # Clean up
         os.unlink(temp_file)
         
         output = result.stdout + result.stderr
+        
+        # Check for common formatting errors and provide helpful feedback
+        if "SyntaxError" in output and "```" in code:
+            return "Code execution error: You included markdown backticks (```) in your code. Please provide only raw Python code without any markdown formatting."
+        
         return f"Code execution result:\n{output[:1000]}{'...' if len(output) > 1000 else ''}"
     except subprocess.TimeoutExpired:
         return "Code execution timed out (30s limit)"
@@ -316,29 +422,6 @@ def translate_text(text: str, target_language: str = "Spanish") -> str:
             return f"Translation service not available for '{text}' to {target_language}. Consider using Google Translate API."
     except Exception as e:
         return f"Translation error: {str(e)}"
-
-@tool
-def generate_report(title: str, data: str) -> str:
-    """Generate a formatted report with the given title and data."""
-    try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        report = f"""
-# {title}
-
-**Generated:** {timestamp}
-
-## Summary
-{data}
-
-## Analysis
-This report was automatically generated by the AI agent.
-
----
-*Report ID: {uuid.uuid4().hex[:8]}*
-"""
-        return f"Generated report:\n{report}"
-    except Exception as e:
-        return f"Report generation error: {str(e)}"
 
 @tool
 def url_fetch(url: str) -> str:
@@ -386,6 +469,9 @@ def json_processor(json_data: str, operation: str = "format") -> str:
 def run_agent(session_id: str, message_id: str, user_input: str, conversation_context: str = ""):
     """Run the agent in a separate thread with message context"""
     try:
+        print(f"Starting agent execution for message {message_id[:8]}... in session {session_id[:8]}...")
+        print(f"User input: {user_input[:100]}...")
+        
         # Update message status to running
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -399,7 +485,6 @@ def run_agent(session_id: str, message_id: str, user_input: str, conversation_co
         
         # Set up agent with tracer
         tracer = SQLiteTracer(message_id)
-        # Using GPT-4 for better reasoning and capabilities
         llm = ChatOpenAI(
             model="gpt-4o", 
             temperature=0.1, 
@@ -419,7 +504,6 @@ def run_agent(session_id: str, message_id: str, user_input: str, conversation_co
             execute_python_code,
             get_weather,
             translate_text,
-            generate_report,
             url_fetch,
             json_processor
         ]
@@ -431,14 +515,174 @@ def run_agent(session_id: str, message_id: str, user_input: str, conversation_co
         # Create agent
         prompt_template = hub.pull("hwchase17/react")
         agent = create_react_agent(llm, tools, prompt_template)
-        executor = AgentExecutor(agent=agent, tools=tools, verbose=True, callbacks=[tracer])
+        executor = AgentExecutor(
+            agent=agent, 
+            tools=tools, 
+            verbose=True, 
+            callbacks=[tracer],
+            handle_parsing_errors=True,  # Allow recovery from parsing errors
+            max_iterations=5,  # Further reduced to prevent endless loops
+            max_execution_time=30,  # Reduced to 30 seconds timeout
+            return_intermediate_steps=False  # Simplify output
+        )
         
-        # Combine context with current input
-        full_input = conversation_context + user_input
+        # Build context with conversation first, then current input, then system context
+        current_date = datetime.now().strftime("%B %d, %Y")
+        current_day = datetime.now().strftime("%A")
         
-        # Execute agent
-        result = executor.invoke({"input": full_input})
-        final_output = result.get("output", "")
+        # Put conversation context and user input FIRST (most important)
+        main_context = conversation_context + user_input
+        
+        # Add system context at the end (supplementary)
+        system_context = f"""
+
+[System Information - Current date: {current_day}, {current_date}]
+
+[Operating Guidelines: TEXT-ONLY environment]
+- Provide text-based responses only
+- No visual plots, charts, or graphs
+- Use text tables/lists for data visualization
+
+[CRITICAL TOOL USAGE RULES - READ CAREFULLY]
+
+IMPORTANT: You MUST follow the ReAct format exactly:
+
+1. TO USE A TOOL:
+Thought: I need to calculate something
+Action: tool_name
+Action Input: raw_input_value
+
+2. TO GIVE FINAL ANSWER (END THE CONVERSATION):
+Final Answer: Your complete response here.
+
+EXAMPLES:
+✅ CORRECT TOOL USAGE:
+Thought: I need to calculate the square root of 16
+Action: calculate_math
+Action Input: sqrt(16)
+
+✅ CORRECT MATH INPUT:
+Action Input: 1 * ln(0.9) / ln(0.9)
+
+❌ WRONG MATH INPUT (causes errors):
+Action Input: "1 * ln(0.9) / ln(0.9)"  # With quotes and comments
+Action Input: "1 * ln(0.9) / ln(0.9)"  # First interval calculation
+
+✅ CORRECT FINAL ANSWER:
+Final Answer: The square root of 16 is 4.
+
+❌ WRONG - CAUSES INFINITE LOOPS:
+Thought: Here's my answer... (WITHOUT Action: or Final Answer:)
+
+RULES:
+- NEVER include markdown backticks (```) in Action Input!
+- After getting your answer, use "Final Answer:" to end
+- NEVER have "Thought:" without either "Action:" or "Final Answer:" following it
+- If a tool fails 3+ times, try a different approach!
+"""
+        
+        full_input = main_context + system_context
+        
+        # Debug logging
+        print(f"Context length: {len(conversation_context)} chars")
+        print(f"User input: {user_input}")
+        print(f"Full input preview: {full_input[:200]}...")
+        if len(conversation_context) > 0:
+            print(f"Conversation context preview: {conversation_context[:150]}...")
+        
+        # Execute agent with fallback
+        try:
+            result = executor.invoke({"input": full_input})
+            final_output = result.get("output", "")
+            
+            # Check if agent hit limits or gave irrelevant response (should be marked as error)
+            is_agent_error = (
+                not final_output or 
+                len(final_output.strip()) < 10 or
+                "iteration limit" in final_output.lower() or
+                "time limit" in final_output.lower() or
+                "stopped due to" in final_output.lower()
+            )
+            
+            # Check for ReAct format loops (Invalid Format errors)
+            is_format_loop = (
+                final_output and
+                ("Invalid Format:" in final_output or
+                 "Missing 'Action:' after 'Thought:'" in final_output or
+                 final_output.count("Invalid Format") > 1)
+            )
+            
+            # Check for completely irrelevant responses (just date, etc.)
+            is_irrelevant = (
+                final_output and 
+                len(final_output.strip()) < 100 and 
+                ("current date is" in final_output.lower() or
+                 final_output.strip().startswith("The current date") or
+                 final_output.strip().startswith("Today is"))
+            )
+            
+            if is_agent_error or is_irrelevant or is_format_loop:
+                if not final_output or len(final_output.strip()) < 10:
+                    final_output = "I encountered technical difficulties while processing your request. Please try rephrasing your question or ask something else."
+                elif is_irrelevant:
+                    final_output = "I apologize, but I gave an irrelevant response. Please let me try to answer your question properly."
+                    raise Exception(f"Agent gave irrelevant response: {final_output}")
+                elif is_format_loop:
+                    final_output = "I encountered a formatting error loop and couldn't complete the task properly. Please try rephrasing your question."
+                    raise Exception(f"Agent stuck in format loop: {final_output}")
+                else:
+                    raise Exception(f"Agent execution failed: {final_output}")
+            
+            print(f"Agent execution completed successfully for message {message_id[:8]}...")
+            print(f"Output length: {len(final_output)} characters")
+            
+        except Exception as agent_error:
+            print(f"Agent execution error for message {message_id[:8]}: {str(agent_error)}")
+            # Provide a context-aware fallback response using direct LLM call, but mark as error
+            try:
+                # Build a context-aware fallback prompt
+                fallback_prompt = f"""Please respond to this query in a helpful way. Use only text - no visual elements.
+
+{conversation_context}Current query: {user_input}
+
+Provide a relevant, helpful response that addresses the user's question in the context of our conversation."""
+
+                fallback_response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": fallback_prompt
+                    }],
+                    max_tokens=500
+                )
+                if fallback_response.choices and fallback_response.choices[0].message:
+                    final_output = fallback_response.choices[0].message.content or "I'm having technical difficulties. Please try again."
+                else:
+                    final_output = "I'm experiencing technical difficulties. Please try again later."
+                print(f"Used context-aware fallback response for message {message_id[:8]}")
+            except Exception as fallback_error:
+                print(f"Fallback also failed for message {message_id[:8]}: {str(fallback_error)}")
+                final_output = "I'm experiencing technical difficulties and cannot process your request at the moment. Please try again later."
+            
+            # Mark as error since agent failed
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE messages 
+                SET status = 'error', content = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE message_id = ?
+            ''', (final_output, message_id))
+            
+            # Update session updated_at
+            cursor.execute('''
+                UPDATE sessions 
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            ''', (session_id,))
+            
+            conn.commit()
+            conn.close()
+            return  # Exit early since we handled the error case
         
         # Update message with final result
         conn = sqlite3.connect(DB_PATH)
@@ -460,45 +704,48 @@ def run_agent(session_id: str, message_id: str, user_input: str, conversation_co
         conn.close()
         
     except Exception as e:
-        # Update message status to error
+        # Log error to console for debugging - this catches unexpected errors not handled above
+        print(f"UNEXPECTED ERROR in run_agent for message {message_id}: {str(e)}")
+        print(f"Session: {session_id}, User input: {user_input[:100]}...")
+        
+        # Update message status to error with a user-friendly message
+        user_friendly_error = "I encountered an unexpected error while processing your request. Please try again later."
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
             UPDATE messages 
-            SET status = 'error', content = ?
+            SET status = 'error', content = ?, completed_at = CURRENT_TIMESTAMP
             WHERE message_id = ?
-        ''', (str(e), message_id))
+        ''', (user_friendly_error, message_id))
+        
+        # Update session updated_at
+        cursor.execute('''
+            UPDATE sessions 
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+        ''', (session_id,))
+        
         conn.commit()
         conn.close()
 
 @app.route('/chat/new', methods=['POST'])
 def chat():
     """
-    Handle chat requests with messages array (OpenAI API format)
-    Accepts optional session_id to continue existing conversations
+    Handle chat requests with simplified format
+    Accepts: prompt (required) and session_id (optional)
     Returns session_id and message_id for the assistant response
     """
     data = request.get_json()
     
-    if not data or 'messages' not in data:
-        return jsonify({"error": "Missing 'messages' in request body"}), 400
+    if not data or 'prompt' not in data:
+        return jsonify({"error": "Missing 'prompt' in request body"}), 400
     
-    messages = data['messages']
+    prompt = data['prompt']
     session_id = data.get('session_id')  # Optional session_id for continuing conversations
     
-    # Validate messages format
-    if not isinstance(messages, list) or len(messages) == 0:
-        return jsonify({"error": "'messages' must be a non-empty array"}), 400
-    
-    for msg in messages:
-        if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
-            return jsonify({"error": "Each message must have 'role' and 'content' fields"}), 400
-        if msg['role'] not in ['user', 'assistant', 'system']:
-            return jsonify({"error": "Message role must be 'user', 'assistant', or 'system'"}), 400
-    
-    # Validate that the last message is from user
-    if messages[-1]['role'] != 'user':
-        return jsonify({"error": "The last message in the messages array must be from 'user'"}), 400
+    # Validate prompt
+    if not isinstance(prompt, str) or not prompt.strip():
+        return jsonify({"error": "'prompt' must be a non-empty string"}), 400
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -510,14 +757,6 @@ def chat():
             cursor.execute('SELECT session_id FROM sessions WHERE session_id = ?', (session_id,))
             if not cursor.fetchone():
                 return jsonify({"error": "Session not found"}), 404
-            
-            # For existing conversations, only store the new user message
-            new_user_message_id = str(uuid.uuid4())
-            cursor.execute('''
-                INSERT INTO messages (message_id, session_id, role, content, status)
-                VALUES (?, ?, 'user', ?, 'completed')
-            ''', (new_user_message_id, session_id, messages[-1]['content']))
-            
         else:
             # Create new conversation
             session_id = str(uuid.uuid4())
@@ -525,16 +764,15 @@ def chat():
                 INSERT INTO sessions (session_id)
                 VALUES (?)
             ''', (session_id,))
-            
-            # For new conversations, store all messages from the array
-            for msg in messages:
-                message_id = str(uuid.uuid4())
-                cursor.execute('''
-                    INSERT INTO messages (message_id, session_id, role, content, status)
-                    VALUES (?, ?, ?, ?, 'completed')
-                ''', (message_id, session_id, msg['role'], msg['content']))
         
-        # Always create a new assistant message for the response (initially pending)
+        # Store the new user message
+        user_message_id = str(uuid.uuid4())
+        cursor.execute('''
+            INSERT INTO messages (message_id, session_id, role, content, status)
+            VALUES (?, ?, 'user', ?, 'completed')
+        ''', (user_message_id, session_id, prompt.strip()))
+        
+        # Create a new assistant message for the response (initially pending)
         assistant_message_id = str(uuid.uuid4())
         cursor.execute('''
             INSERT INTO messages (message_id, session_id, role, content, status)
@@ -543,26 +781,30 @@ def chat():
         
         conn.commit()
         
-        # Build conversation context from messages (excluding the last user message)
-        conversation_context = ""
-        if len(messages) > 1:
-            context_messages = []
-            for msg in messages[:-1]:
-                if msg["role"] == "user":
-                    context_messages.append(f"Human: {msg['content']}")
-                elif msg["role"] == "assistant":
-                    context_messages.append(f"Assistant: {msg['content']}")
-                elif msg["role"] == "system":
-                    context_messages.append(f"System: {msg['content']}")
-            
-            if context_messages:
-                conversation_context = "Previous conversation:\n" + "\n".join(context_messages) + "\n\nCurrent request:\n"
+        # Build conversation context from database history (excluding current message and errors)
+        cursor.execute('''
+            SELECT role, content FROM messages 
+            WHERE session_id = ? AND message_id != ? AND status = 'completed'
+            ORDER BY created_at
+        ''', (session_id, user_message_id))
         
-        # Get the current user input (last message)
-        user_input = messages[-1]["content"]
+        history_messages = cursor.fetchall()
+        conversation_context = ""
+        
+        if history_messages:
+            context_parts = []
+            for role, content in history_messages:
+                if role == "user":
+                    context_parts.append(f"Human: {content}")
+                elif role == "assistant":
+                    context_parts.append(f"Assistant: {content}")
+                elif role == "system":
+                    context_parts.append(f"System: {content}")
+            
+            conversation_context = "Previous conversation:\n" + "\n".join(context_parts) + "\n\nCurrent request:\n"
         
         # Start agent execution in background thread
-        thread = threading.Thread(target=run_agent, args=(session_id, assistant_message_id, user_input, conversation_context))
+        thread = threading.Thread(target=run_agent, args=(session_id, assistant_message_id, prompt.strip(), conversation_context))
         thread.daemon = True
         thread.start()
         
@@ -718,4 +960,4 @@ if __name__ == '__main__':
     if not os.environ.get("OPENAI_API_KEY"):
         print("Warning: OPENAI_API_KEY environment variable not set")
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5000, use_reloader=True, reloader_type='stat')
