@@ -4,6 +4,7 @@ import json
 import math
 import statistics
 import re
+import pytz
 import tempfile
 import subprocess
 import requests
@@ -23,7 +24,7 @@ def web_search(query: str, num_results: int = 5) -> str:
 				f"Use web_search. Answer concisely, then list up to {num_results} sources with links."
 				f"\nQuery: {query}"
 			),
-			tools=[{"type": "web_search"}],
+			tools=[{"type": "web_search"}], # type: ignore
 			tool_choice="auto",
 			max_output_tokens=600,
 		)
@@ -44,58 +45,39 @@ def web_search(query: str, num_results: int = 5) -> str:
 def get_current_time(timezone: str = "UTC") -> str:
 	"""Get current time in specified timezone (e.g., 'UTC', 'US/Eastern', 'Europe/London')."""
 	try:
-		# Try with pytz if available and valid
-		try:
-			import pytz
-			# Handle UTC offset like 'UTC+2', 'UTC-5', etc.
-			if timezone.upper().startswith("UTC") and len(timezone) > 3:
-				offset_str = timezone[3:]
-				sign = 1 if "+" in offset_str else -1
-				try:
-					hours = int(offset_str.replace("+", "").replace("-", ""))
-				except Exception:
-					return f"Invalid UTC offset format: {timezone}"
-				from datetime import timedelta
-				current_time = datetime.utcnow() + timedelta(hours=sign * hours)
-				return f"Current time in {timezone}: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (UTC offset)"
-			elif timezone.upper() == "UTC":
+
+		# Handle UTC offset like 'UTC+2', 'UTC-5', etc.
+		if timezone.upper().startswith("UTC") and len(timezone) > 3:
+			offset_str = timezone[3:]
+			sign = 1 if "+" in offset_str else -1
+			try:
+				hours = int(offset_str.replace("+", "").replace("-", ""))
+			except Exception:
+				return f"Invalid UTC offset format: {timezone}"
+			from datetime import timedelta
+			current_time = datetime.utcnow() + timedelta(hours=sign * hours)
+			return f"Current time in {timezone}: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (UTC offset)"
+
+		# Handle UTC
+		if timezone.upper() == "UTC":
+			if pytz:
 				tz = pytz.UTC
 				current_time = datetime.now(tz)
 				return f"Current time in UTC: {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
 			else:
-				try:
-					tz = pytz.timezone(timezone)
-					current_time = datetime.now(tz)
-					return f"Current time in {timezone}: {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-				except Exception:
-					# Fallback: try to parse as UTC offset if pytz fails
-					if timezone.upper().startswith("UTC") and len(timezone) > 3:
-						offset_str = timezone[3:]
-						sign = 1 if "+" in offset_str else -1
-						try:
-							hours = int(offset_str.replace("+", "").replace("-", ""))
-						except Exception:
-							return f"Invalid UTC offset format: {timezone}"
-						from datetime import timedelta
-						current_time = datetime.utcnow() + timedelta(hours=sign * hours)
-						return f"Current time in {timezone}: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (UTC offset fallback)"
-					else:
-						return f"Unknown or unsupported timezone: {timezone}"
-		except ImportError:
-			# Fallback without pytz
-			if timezone.upper().startswith("UTC") and len(timezone) > 3:
-				offset_str = timezone[3:]
-				sign = 1 if "+" in offset_str else -1
-				try:
-					hours = int(offset_str.replace("+", "").replace("-", ""))
-				except Exception:
-					return f"Invalid UTC offset format: {timezone}"
-				from datetime import timedelta
-				current_time = datetime.utcnow() + timedelta(hours=sign * hours)
-				return f"Current time in {timezone}: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (UTC offset, pytz not available)"
-			else:
 				current_time = datetime.utcnow()
 				return f"Current UTC time: {current_time.strftime('%Y-%m-%d %H:%M:%S UTC')} (pytz not available for timezone conversion)"
+
+		# Handle IANA timezones (like 'Asia/Tokyo')
+		if pytz:
+			try:
+				tz = pytz.timezone(timezone)
+				current_time = datetime.now(tz)
+				return f"Current time in {timezone}: {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+			except Exception:
+				return f"Unknown or unsupported timezone: {timezone}"
+		else:
+			return f"Timezone '{timezone}' requires pytz. Only 'UTC' and 'UTC±offset' are supported without pytz."
 	except Exception as e:
 		return f"Time error: {str(e)}"
 
