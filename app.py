@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from flask import Flask, request, jsonify
+from openai import OpenAI
 
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_react_agent, AgentExecutor
@@ -26,6 +27,7 @@ from langchain.callbacks.base import BaseCallbackHandler
 from langchain.schema import HumanMessage, AIMessage, SystemMessage
 
 app = Flask(__name__)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Database setup
 DB_PATH = "agent_traces.db"
@@ -35,27 +37,38 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Sessions table
+    # Sessions table - represents a conversation thread
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
-            initial_prompt TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            final_output TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    # Traces table
+    # Messages table - individual messages within sessions
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+            content TEXT NOT NULL,
+            status TEXT DEFAULT 'completed' CHECK (status IN ('pending', 'running', 'completed', 'error')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+        )
+    ''')
+    
+    # Traces table - execution traces for assistant messages
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS traces (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
             event TEXT NOT NULL,
             data TEXT NOT NULL,
             timestamp REAL NOT NULL,
-            FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+            FOREIGN KEY (message_id) REFERENCES messages (message_id)
         )
     ''')
     
@@ -65,19 +78,19 @@ def init_db():
 class SQLiteTracer(BaseCallbackHandler):
     """Tracer that stores events in SQLite database"""
     
-    def __init__(self, session_id: str):
-        self.session_id = session_id
+    def __init__(self, message_id: str):
+        self.message_id = message_id
     
     def _write(self, record: Dict[str, Any]):
         """Write a trace record to the database"""
-        record.update({"ts": time.time(), "session_id": self.session_id})
+        record.update({"ts": time.time(), "message_id": self.message_id})
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO traces (session_id, event, data, timestamp)
+            INSERT INTO traces (message_id, event, data, timestamp)
             VALUES (?, ?, ?, ?)
-        ''', (self.session_id, record.get("event", "unknown"), json.dumps(record), record["ts"]))
+        ''', (self.message_id, record.get("event", "unknown"), json.dumps(record), record["ts"]))
         conn.commit()
         conn.close()
 
@@ -112,45 +125,31 @@ class SQLiteTracer(BaseCallbackHandler):
 
 @tool
 def web_search(query: str, num_results: int = 5) -> str:
-    """Search the web for information using multiple free sources."""
+    """Search the web using OpenAI's web search tool and return a concise, cited answer."""
     try:
-        from urllib.parse import quote
-        
-        # Method 1: Try DuckDuckGo instant answers
-        ddg_url = f"https://api.duckduckgo.com/?q={quote(query)}&format=json&no_html=1&skip_disambig=1"
-        
-        response = requests.get(ddg_url, timeout=10, headers={
-            'User-Agent': 'Mozilla/5.0 (compatible; AI Agent/1.0)'
-        })
-        
-        if response.status_code == 200:
-            data = response.json()
-            results = []
-            
-            if data.get('Abstract'):
-                results.append(f"Summary: {data['Abstract']}")
-            
-            if data.get('RelatedTopics'):
-                for topic in data['RelatedTopics'][:num_results]:
-                    if isinstance(topic, dict) and topic.get('Text'):
-                        results.append(f"• {topic['Text']}")
-            
-            if results:
-                return "\n".join(results)
-        
-        # Method 2: Fallback to Wikipedia search
-        wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(query)}"
-        wiki_response = requests.get(wiki_url, timeout=10)
-        
-        if wiki_response.status_code == 200:
-            wiki_data = wiki_response.json()
-            if wiki_data.get('extract'):
-                return f"Wikipedia Summary: {wiki_data['extract']}"
-        
-        return f"Limited search results available for '{query}'. Try a more specific query."
-        
+        resp = client.responses.create(
+            model="gpt-4o",
+            input=(
+                f"Use web_search. Answer concisely, then list up to {num_results} sources with links."
+                f"\nQuery: {query}"
+            ),
+            tools=[{"type": "web_search"}],
+            tool_choice="auto",
+            max_output_tokens=600,
+        )
+        # Prefer SDK convenience field; fall back to manual parse
+        text = getattr(resp, "output_text", "") or ""
+        if not text and getattr(resp, "output", None):
+            parts = []
+            for item in resp.output:
+                if getattr(item, "type", "") == "output_text":
+                    for seg in getattr(item, "content", []) or []:
+                        if hasattr(seg, "text"):
+                            parts.append(seg.text)
+            text = "\n".join(parts).strip()
+        return text or "No results."
     except Exception as e:
-        return f"Search unavailable: {str(e)}"
+        return f"Search unavailable: {e}"
 
 @tool
 def get_current_time(timezone: str = "UTC") -> str:
@@ -384,25 +383,25 @@ def json_processor(json_data: str, operation: str = "format") -> str:
 # Note: get_conversation_history function removed as we now use messages array directly
 # instead of reconstructing history from traces
 
-def run_agent(session_id: str, messages: List[Dict[str, str]]):
-    """Run the agent in a separate thread with conversation messages"""
+def run_agent(session_id: str, message_id: str, user_input: str, conversation_context: str = ""):
+    """Run the agent in a separate thread with message context"""
     try:
-        # Update session status to running
+        # Update message status to running
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            UPDATE sessions 
+            UPDATE messages 
             SET status = 'running' 
-            WHERE session_id = ?
-        ''', (session_id,))
+            WHERE message_id = ?
+        ''', (message_id,))
         conn.commit()
         conn.close()
         
         # Set up agent with tracer
-        tracer = SQLiteTracer(session_id)
+        tracer = SQLiteTracer(message_id)
         # Using GPT-4 for better reasoning and capabilities
         llm = ChatOpenAI(
-            model="gpt-4", 
+            model="gpt-4o", 
             temperature=0.1, 
             callbacks=[tracer],
             openai_api_key=os.environ.get("OPENAI_API_KEY")
@@ -434,52 +433,41 @@ def run_agent(session_id: str, messages: List[Dict[str, str]]):
         agent = create_react_agent(llm, tools, prompt_template)
         executor = AgentExecutor(agent=agent, tools=tools, verbose=True, callbacks=[tracer])
         
-        # Convert messages to conversation context and get the latest user message
-        conversation_context = ""
-        current_user_input = ""
-        
-        if len(messages) > 1:
-            # Build conversation context from all but the last message
-            context_messages = []
-            for msg in messages[:-1]:
-                if msg["role"] == "user":
-                    context_messages.append(f"Human: {msg['content']}")
-                elif msg["role"] == "assistant":
-                    context_messages.append(f"Assistant: {msg['content']}")
-            
-            if context_messages:
-                conversation_context = "Previous conversation:\n" + "\n".join(context_messages) + "\n\nCurrent request:\n"
-        
-        # Get the current user input (last message is guaranteed to be from user due to validation)
-        current_user_input = messages[-1]["content"]
-        
         # Combine context with current input
-        full_input = conversation_context + current_user_input
+        full_input = conversation_context + user_input
         
         # Execute agent
         result = executor.invoke({"input": full_input})
         final_output = result.get("output", "")
         
-        # Update session with final result
+        # Update message with final result
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
+            UPDATE messages 
+            SET status = 'completed', content = ?, completed_at = CURRENT_TIMESTAMP
+            WHERE message_id = ?
+        ''', (final_output, message_id))
+        
+        # Update session updated_at
+        cursor.execute('''
             UPDATE sessions 
-            SET status = 'completed', final_output = ?, completed_at = CURRENT_TIMESTAMP
+            SET updated_at = CURRENT_TIMESTAMP
             WHERE session_id = ?
-        ''', (final_output, session_id))
+        ''', (session_id,))
+        
         conn.commit()
         conn.close()
         
     except Exception as e:
-        # Update session status to error
+        # Update message status to error
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            UPDATE sessions 
-            SET status = 'error', final_output = ?
-            WHERE session_id = ?
-        ''', (str(e), session_id))
+            UPDATE messages 
+            SET status = 'error', content = ?
+            WHERE message_id = ?
+        ''', (str(e), message_id))
         conn.commit()
         conn.close()
 
@@ -487,6 +475,8 @@ def run_agent(session_id: str, messages: List[Dict[str, str]]):
 def chat():
     """
     Handle chat requests with messages array (OpenAI API format)
+    Accepts optional session_id to continue existing conversations
+    Returns session_id and message_id for the assistant response
     """
     data = request.get_json()
     
@@ -494,6 +484,7 @@ def chat():
         return jsonify({"error": "Missing 'messages' in request body"}), 400
     
     messages = data['messages']
+    session_id = data.get('session_id')  # Optional session_id for continuing conversations
     
     # Validate messages format
     if not isinstance(messages, list) or len(messages) == 0:
@@ -509,52 +500,94 @@ def chat():
     if messages[-1]['role'] != 'user':
         return jsonify({"error": "The last message in the messages array must be from 'user'"}), 400
     
-    # Always create a new session
-    session_id = str(uuid.uuid4())
-    
-    # Get initial prompt from first user message for session tracking
-    initial_prompt = ""
-    for msg in messages:
-        if msg['role'] == 'user':
-            initial_prompt = msg['content']
-            break
-    
-    if not initial_prompt:
-        initial_prompt = "Conversation started"
-    
-    # Create new session
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO sessions (session_id, initial_prompt, status)
-        VALUES (?, ?, 'pending')
-    ''', (session_id, initial_prompt))
-    conn.commit()
-    conn.close()
     
-    # Start agent execution in background thread with messages
-    thread = threading.Thread(target=run_agent, args=(session_id, messages))
-    thread.daemon = True
-    thread.start()
-    
-    return jsonify({"session_id": session_id})
+    try:
+        # Handle existing vs new conversation
+        if session_id:
+            # Validate that the session exists
+            cursor.execute('SELECT session_id FROM sessions WHERE session_id = ?', (session_id,))
+            if not cursor.fetchone():
+                return jsonify({"error": "Session not found"}), 404
+            
+            # For existing conversations, only store the new user message
+            new_user_message_id = str(uuid.uuid4())
+            cursor.execute('''
+                INSERT INTO messages (message_id, session_id, role, content, status)
+                VALUES (?, ?, 'user', ?, 'completed')
+            ''', (new_user_message_id, session_id, messages[-1]['content']))
+            
+        else:
+            # Create new conversation
+            session_id = str(uuid.uuid4())
+            cursor.execute('''
+                INSERT INTO sessions (session_id)
+                VALUES (?)
+            ''', (session_id,))
+            
+            # For new conversations, store all messages from the array
+            for msg in messages:
+                message_id = str(uuid.uuid4())
+                cursor.execute('''
+                    INSERT INTO messages (message_id, session_id, role, content, status)
+                    VALUES (?, ?, ?, ?, 'completed')
+                ''', (message_id, session_id, msg['role'], msg['content']))
+        
+        # Always create a new assistant message for the response (initially pending)
+        assistant_message_id = str(uuid.uuid4())
+        cursor.execute('''
+            INSERT INTO messages (message_id, session_id, role, content, status)
+            VALUES (?, ?, 'assistant', '', 'pending')
+        ''', (assistant_message_id, session_id))
+        
+        conn.commit()
+        
+        # Build conversation context from messages (excluding the last user message)
+        conversation_context = ""
+        if len(messages) > 1:
+            context_messages = []
+            for msg in messages[:-1]:
+                if msg["role"] == "user":
+                    context_messages.append(f"Human: {msg['content']}")
+                elif msg["role"] == "assistant":
+                    context_messages.append(f"Assistant: {msg['content']}")
+                elif msg["role"] == "system":
+                    context_messages.append(f"System: {msg['content']}")
+            
+            if context_messages:
+                conversation_context = "Previous conversation:\n" + "\n".join(context_messages) + "\n\nCurrent request:\n"
+        
+        # Get the current user input (last message)
+        user_input = messages[-1]["content"]
+        
+        # Start agent execution in background thread
+        thread = threading.Thread(target=run_agent, args=(session_id, assistant_message_id, user_input, conversation_context))
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            "session_id": session_id, 
+            "message_id": assistant_message_id
+        })
+        
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
+    finally:
+        conn.close()
 
-@app.route('/chat', methods=['GET'])
-def get_traces():
+@app.route('/sessions/<session_id>', methods=['GET'])
+def get_session(session_id):
     """
-    Get all traces for a given session_id
+    Get all messages in a session
     """
-    session_id = request.args.get('session_id')
-    
-    if not session_id:
-        return jsonify({"error": "Missing 'session_id' parameter"}), 400
-    
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     # Get session info
     cursor.execute('''
-        SELECT session_id, initial_prompt, status, final_output, created_at, completed_at
+        SELECT session_id, created_at, updated_at
         FROM sessions WHERE session_id = ?
     ''', (session_id,))
     session_row = cursor.fetchone()
@@ -563,25 +596,85 @@ def get_traces():
         conn.close()
         return jsonify({"error": "Session not found"}), 404
     
-    # Get all traces for this session
+    # Get all messages for this session
     cursor.execute('''
-        SELECT event, data, timestamp
-        FROM traces 
+        SELECT message_id, role, content, status, created_at, completed_at
+        FROM messages 
         WHERE session_id = ?
-        ORDER BY timestamp
+        ORDER BY created_at
     ''', (session_id,))
-    trace_rows = cursor.fetchall()
+    message_rows = cursor.fetchall()
     
     conn.close()
     
     # Format response
     session_info = {
         "session_id": session_row[0],
-        "initial_prompt": session_row[1],
-        "status": session_row[2],
-        "final_output": session_row[3],
-        "created_at": session_row[4],
-        "completed_at": session_row[5]
+        "created_at": session_row[1],
+        "updated_at": session_row[2]
+    }
+    
+    messages = []
+    for message_id, role, content, status, created_at, completed_at in message_rows:
+        message = {
+            "message_id": message_id,
+            "role": role,
+            "content": content,
+            "status": status,
+            "created_at": created_at,
+            "completed_at": completed_at
+        }
+        messages.append(message)
+    
+    return jsonify({
+        "session": session_info,
+        "messages": messages
+    })
+
+@app.route('/messages/<message_id>/traces', methods=['GET'])
+def get_message_traces(message_id):
+    """
+    Get all traces for a specific message (assistant messages only)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Get message info
+    cursor.execute('''
+        SELECT message_id, session_id, role, content, status, created_at, completed_at
+        FROM messages WHERE message_id = ?
+    ''', (message_id,))
+    message_row = cursor.fetchone()
+    
+    if not message_row:
+        conn.close()
+        return jsonify({"error": "Message not found"}), 404
+    
+    # Only assistant messages have traces
+    if message_row[2] != 'assistant':  # role is at index 2
+        conn.close()
+        return jsonify({"error": "Only assistant messages have execution traces"}), 400
+    
+    # Get all traces for this message
+    cursor.execute('''
+        SELECT event, data, timestamp
+        FROM traces 
+        WHERE message_id = ?
+        ORDER BY timestamp
+    ''', (message_id,))
+    trace_rows = cursor.fetchall()
+    
+    conn.close()
+    
+    # Format response
+    message_info = {
+        "message_id": message_row[0],
+        "session_id": message_row[1],
+        "role": message_row[2],
+        "content": message_row[3],
+        "status": message_row[4],
+        "created_at": message_row[5],
+        "completed_at": message_row[6]
     }
     
     traces = []
@@ -593,11 +686,26 @@ def get_traces():
             traces.append({"event": event, "data": data, "timestamp": timestamp})
     
     return jsonify({
-        "session": session_info,
+        "message": message_info,
         "traces": traces
     })
 
-@app.route('/health', methods=['GET'])
+# Legacy endpoint for backward compatibility (deprecated)
+@app.route('/chat', methods=['GET'])
+def get_legacy_traces():
+    """
+    Legacy endpoint - redirects to new conversation-based API
+    """
+    session_id = request.args.get('session_id')
+    if session_id:
+        return jsonify({
+            "error": "This endpoint is deprecated. Use /sessions/{session_id} instead.",
+            "migration_note": "The new API uses session_id and message_id for better tracking"
+        }), 410  # Gone
+    else:
+        return jsonify({"error": "Missing 'session_id' parameter"}), 400
+
+@app.route('/', methods=['GET'])
 def health():
     """Health check endpoint"""
     return jsonify({"status": "healthy"})

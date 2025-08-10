@@ -6,3 +6,4 @@ tiktoken
 langchainhub
 requests
 pytz
+openai
