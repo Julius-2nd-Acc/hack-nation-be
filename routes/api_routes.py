@@ -19,7 +19,6 @@ def register_routes(app):
 	def chat_replay():
 		sys.modules.pop('app', None)  # Prevent circular import if present
 		data = request.get_json()
-		history = data.get('history')
 		traces = data.get('traces')
 		user_prompt = data.get('user_prompt') or None
 		
@@ -45,19 +44,7 @@ def register_routes(app):
 			replay_input = ""
 		# Reconstruct conversation context from history if provided
 		conversation_context = ""
-		if history and isinstance(history, list):
-			context_parts = []
-			for msg in history:
-				role = msg.get("role")
-				content = msg.get("content", "")
-				if role == "user":
-					context_parts.append(f"Human: {content}")
-				elif role == "assistant":
-					context_parts.append(f"Assistant: {content}")
-				elif role == "system":
-					context_parts.append(f"System: {content}")
-			if context_parts:
-				conversation_context = "Previous conversation:\n" + "\n".join(context_parts) + "\n\nCurrent request:\n"
+
 		# Use a temp session_id and message_id for replay
 		import uuid
 		session_id = str(uuid.uuid4())
