@@ -23,6 +23,7 @@ from langchain.agents import create_react_agent, AgentExecutor
 from langchain import hub
 from langchain.tools import tool
 from langchain.callbacks.base import BaseCallbackHandler
+from langchain.schema import HumanMessage, AIMessage, SystemMessage
 
 app = Flask(__name__)
 
@@ -380,64 +381,11 @@ def json_processor(json_data: str, operation: str = "format") -> str:
     except Exception as e:
         return f"JSON processing error: {str(e)}"
 
-def get_conversation_history(session_id: str) -> str:
-    """Reconstruct conversation history from traces"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Get session initial prompt
-    cursor.execute('SELECT initial_prompt FROM sessions WHERE session_id = ?', (session_id,))
-    session_row = cursor.fetchone()
-    initial_prompt = session_row[0] if session_row else ""
-    
-    # Get all traces for this session
-    cursor.execute('''
-        SELECT event, data, timestamp
-        FROM traces 
-        WHERE session_id = ?
-        ORDER BY timestamp
-    ''', (session_id,))
-    trace_rows = cursor.fetchall()
-    conn.close()
-    
-    # Reconstruct conversation
-    conversation_history = f"Previous conversation history for session {session_id}:\n\n"
-    conversation_history += f"Initial request: {initial_prompt}\n\n"
-    
-    # Track conversation flow
-    current_input = None
-    responses = []
-    
-    for event, data_str, timestamp in trace_rows:
-        try:
-            data = json.loads(data_str)
-            event_type = data.get("event", "")
-            
-            # Track chain starts (user inputs)
-            if event_type == "chain_start":
-                inputs = data.get("inputs", {})
-                if isinstance(inputs, dict) and "input" in inputs:
-                    current_input = inputs["input"]
-            
-            # Track final outputs
-            elif event_type == "chain_end":
-                outputs = data.get("outputs", {})
-                if isinstance(outputs, dict) and "output" in outputs:
-                    if current_input:
-                        responses.append(f"Human: {current_input}")
-                        responses.append(f"Assistant: {outputs['output']}")
-                        current_input = None
-                    
-        except (json.JSONDecodeError, KeyError):
-            continue
-    
-    if responses:
-        conversation_history += "Previous exchanges:\n" + "\n\n".join(responses) + "\n\n"
-    
-    return conversation_history
+# Note: get_conversation_history function removed as we now use messages array directly
+# instead of reconstructing history from traces
 
-def run_agent(session_id: str, prompt: str, conversation_history: str = ""):
-    """Run the agent in a separate thread"""
+def run_agent(session_id: str, messages: List[Dict[str, str]]):
+    """Run the agent in a separate thread with conversation messages"""
     try:
         # Update session status to running
         conn = sqlite3.connect(DB_PATH)
@@ -453,7 +401,12 @@ def run_agent(session_id: str, prompt: str, conversation_history: str = ""):
         # Set up agent with tracer
         tracer = SQLiteTracer(session_id)
         # Using GPT-4 for better reasoning and capabilities
-        llm = ChatOpenAI(model="gpt-4", temperature=0.1, callbacks=[tracer])
+        llm = ChatOpenAI(
+            model="gpt-4", 
+            temperature=0.1, 
+            callbacks=[tracer],
+            openai_api_key=os.environ.get("OPENAI_API_KEY")
+        )
         
         # Comprehensive tool arsenal
         tools = [
@@ -481,11 +434,27 @@ def run_agent(session_id: str, prompt: str, conversation_history: str = ""):
         agent = create_react_agent(llm, tools, prompt_template)
         executor = AgentExecutor(agent=agent, tools=tools, verbose=True, callbacks=[tracer])
         
-        # Prepare input with conversation history if available
-        if conversation_history:
-            full_input = f"{conversation_history}Current request: {prompt}"
-        else:
-            full_input = prompt
+        # Convert messages to conversation context and get the latest user message
+        conversation_context = ""
+        current_user_input = ""
+        
+        if len(messages) > 1:
+            # Build conversation context from all but the last message
+            context_messages = []
+            for msg in messages[:-1]:
+                if msg["role"] == "user":
+                    context_messages.append(f"Human: {msg['content']}")
+                elif msg["role"] == "assistant":
+                    context_messages.append(f"Assistant: {msg['content']}")
+            
+            if context_messages:
+                conversation_context = "Previous conversation:\n" + "\n".join(context_messages) + "\n\nCurrent request:\n"
+        
+        # Get the current user input (last message is guaranteed to be from user due to validation)
+        current_user_input = messages[-1]["content"]
+        
+        # Combine context with current input
+        full_input = conversation_context + current_user_input
         
         # Execute agent
         result = executor.invoke({"input": full_input})
@@ -517,42 +486,54 @@ def run_agent(session_id: str, prompt: str, conversation_history: str = ""):
 @app.route('/chat/new', methods=['POST'])
 def chat():
     """
-    Handle chat requests with prompt and optional session_id
+    Handle chat requests with messages array (OpenAI API format)
     """
     data = request.get_json()
     
-    if not data or 'prompt' not in data:
-        return jsonify({"error": "Missing 'prompt' in request body"}), 400
+    if not data or 'messages' not in data:
+        return jsonify({"error": "Missing 'messages' in request body"}), 400
     
-    prompt = data['prompt']
-    session_id = data.get('session_id')
-    conversation_history = ""
+    messages = data['messages']
     
+    # Validate messages format
+    if not isinstance(messages, list) or len(messages) == 0:
+        return jsonify({"error": "'messages' must be a non-empty array"}), 400
+    
+    for msg in messages:
+        if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
+            return jsonify({"error": "Each message must have 'role' and 'content' fields"}), 400
+        if msg['role'] not in ['user', 'assistant', 'system']:
+            return jsonify({"error": "Message role must be 'user', 'assistant', or 'system'"}), 400
+    
+    # Validate that the last message is from user
+    if messages[-1]['role'] != 'user':
+        return jsonify({"error": "The last message in the messages array must be from 'user'"}), 400
+    
+    # Always create a new session
+    session_id = str(uuid.uuid4())
+    
+    # Get initial prompt from first user message for session tracking
+    initial_prompt = ""
+    for msg in messages:
+        if msg['role'] == 'user':
+            initial_prompt = msg['content']
+            break
+    
+    if not initial_prompt:
+        initial_prompt = "Conversation started"
+    
+    # Create new session
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO sessions (session_id, initial_prompt, status)
+        VALUES (?, ?, 'pending')
+    ''', (session_id, initial_prompt))
+    conn.commit()
+    conn.close()
     
-    if session_id:
-        # Check if session exists
-        cursor.execute('SELECT session_id FROM sessions WHERE session_id = ?', (session_id,))
-        if not cursor.fetchone():
-            conn.close()
-            return jsonify({"error": "Session not found"}), 404
-        
-        # Load conversation history for existing session
-        conn.close()
-        conversation_history = get_conversation_history(session_id)
-    else:
-        # Create new session
-        session_id = str(uuid.uuid4())
-        cursor.execute('''
-            INSERT INTO sessions (session_id, initial_prompt, status)
-            VALUES (?, ?, 'pending')
-        ''', (session_id, prompt))
-        conn.commit()
-        conn.close()
-    
-    # Start agent execution in background thread with conversation history
-    thread = threading.Thread(target=run_agent, args=(session_id, prompt, conversation_history))
+    # Start agent execution in background thread with messages
+    thread = threading.Thread(target=run_agent, args=(session_id, messages))
     thread.daemon = True
     thread.start()
     
