@@ -9,26 +9,31 @@ import sqlite3
 from datetime import datetime
 import threading
 
-def run_agent(session_id: str, message_id: str, user_input: str, conversation_context: str = ""):
+def run_agent(session_id: str, message_id: str, user_input: str, conversation_context: str = "", tracer=None):
     try:
         print(f"Starting agent execution for message {message_id[:8]}... in session {session_id[:8]}...")
         print(f"User input: {user_input[:100]}...")
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE messages 
-            SET status = 'running' 
-            WHERE message_id = ?
-        ''', (message_id,))
-        conn.commit()
-        conn.close()
-        tracer = SQLiteTracer(message_id)
+        # Only update DB if using persistent DB (not for replay)
+        use_db = tracer is None
+        if use_db:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE messages 
+                SET status = 'running' 
+                WHERE message_id = ?
+            ''', (message_id,))
+            conn.commit()
+            conn.close()
+        # Use provided tracer or default
+        if tracer is None:
+            tracer = SQLiteTracer(message_id)
         from pydantic import SecretStr
         llm = ChatOpenAI(
             model="gpt-4o",
-            temperature=0.1,
+            temperature=0, # set to 0 for deterministic output
             callbacks=[tracer],
-            # openai_api_key=os.environ.get("OPENAI_API_KEY"),
+            seed=69,  # Optional: set seed for reproducibility
             api_key=SecretStr(os.environ["OPENAI_API_KEY"])
         )
         tools = [
@@ -61,9 +66,56 @@ def run_agent(session_id: str, message_id: str, user_input: str, conversation_co
         )
         current_date = datetime.now().strftime("%B %d, %Y")
         current_day = datetime.now().strftime("%A")
+
+        now = datetime.now().astimezone()
+        current_time = now.strftime("%H:%M:%S %Z")
+
         main_context = conversation_context + user_input
         system_context = f"""
-\n[System Information - Current date: {current_day}, {current_date}]\n\n[Operating Guidelines: TEXT-ONLY environment]\n- Provide text-based responses only\n- No visual plots, charts, or graphs\n- Use text tables/lists for data visualization\n\n[CRITICAL TOOL USAGE RULES - READ CAREFULLY]\n\nIMPORTANT: You MUST follow the ReAct format exactly:\n\n1. TO USE A TOOL:\nThought: I need to calculate something\nAction: tool_name\nAction Input: raw_input_value\n\n2. TO GIVE FINAL ANSWER (END THE CONVERSATION):\nFinal Answer: Your complete response here.\n\nEXAMPLES:\n✅ CORRECT TOOL USAGE:\nThought: I need to calculate the square root of 16\nAction: calculate_math\nAction Input: sqrt(16)\n\n✅ CORRECT MATH INPUT:\nAction Input: 1 * ln(0.9) / ln(0.9)\n\n❌ WRONG MATH INPUT (causes errors):\nAction Input: \"1 * ln(0.9) / ln(0.9)\"  # With quotes and comments\nAction Input: \"1 * ln(0.9) / ln(0.9)\"  # First interval calculation\n\n✅ CORRECT FINAL ANSWER:\nFinal Answer: The square root of 16 is 4.\n\n❌ WRONG - CAUSES INFINITE LOOPS:\nThought: Here's my answer... (WITHOUT Action: or Final Answer:)\n\nRULES:\n- NEVER include markdown backticks (```) in Action Input!\n- After getting your answer, use \"Final Answer:\" to end\n- NEVER have \"Thought:\" without either \"Action:\" or \"Final Answer:\" following it\n- If a tool fails 3+ times, try a different approach!\n"""
+[System Information - Current date: {current_day}, {current_date}, Current time: {current_time}]
+
+[Operating Guidelines: TEXT-ONLY environment]
+- Provide text-based responses only
+- No visual plots, charts, or graphs
+- Use text tables/lists for data visualization
+
+[CRITICAL TOOL USAGE RULES - READ CAREFULLY]
+
+IMPORTANT: You MUST follow the ReAct format exactly:
+
+1. TO USE A TOOL:
+Thought: I need to calculate something
+Action: tool_name
+Action Input: raw_input_value
+
+2. TO GIVE FINAL ANSWER (END THE CONVERSATION):
+Final Answer: Your complete response here.
+
+EXAMPLES:
+✅ CORRECT TOOL USAGE:
+Thought: I need to calculate the square root of 16
+Action: calculate_math
+Action Input: sqrt(16)
+
+✅ CORRECT MATH INPUT:
+Action Input: 1 * ln(0.9) / ln(0.9)
+
+❌ WRONG MATH INPUT (causes errors):
+Action Input: "1 * ln(0.9) / ln(0.9)"  # With quotes and comments
+Action Input: "1 * ln(0.9) / ln(0.9)"  # First interval calculation
+
+✅ CORRECT FINAL ANSWER:
+Final Answer: The square root of 16 is 4.
+
+❌ WRONG - CAUSES INFINITE LOOPS:
+Thought: Here's my answer... (WITHOUT Action: or Final Answer:)
+
+RULES:
+- NEVER include markdown backticks (```) in Action Input!
+- After getting your answer, use "Final Answer:" to end
+- NEVER have "Thought:" without either "Action:" or "Final Answer:" following it
+- If a tool fails 3+ times, try a different approach!
+"""
         full_input = main_context + system_context
         try:
             result = executor.invoke({"input": full_input})
@@ -122,11 +174,28 @@ def run_agent(session_id: str, message_id: str, user_input: str, conversation_co
             except Exception as fallback_error:
                 print(f"Fallback also failed for message {message_id[:8]}: {str(fallback_error)}")
                 final_output = "I'm experiencing technical difficulties and cannot process your request at the moment. Please try again later."
+            if use_db:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE messages 
+                    SET status = 'error', content = ?, completed_at = CURRENT_TIMESTAMP
+                    WHERE message_id = ?
+                ''', (final_output, message_id))
+                cursor.execute('''
+                    UPDATE sessions 
+                    SET updated_at = CURRENT_TIMESTAMP
+                    WHERE session_id = ?
+                ''', (session_id,))
+                conn.commit()
+                conn.close()
+            return final_output
+        if use_db:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute('''
                 UPDATE messages 
-                SET status = 'error', content = ?, completed_at = CURRENT_TIMESTAMP
+                SET status = 'completed', content = ?, completed_at = CURRENT_TIMESTAMP
                 WHERE message_id = ?
             ''', (final_output, message_id))
             cursor.execute('''
@@ -136,36 +205,24 @@ def run_agent(session_id: str, message_id: str, user_input: str, conversation_co
             ''', (session_id,))
             conn.commit()
             conn.close()
-            return
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE messages 
-            SET status = 'completed', content = ?, completed_at = CURRENT_TIMESTAMP
-            WHERE message_id = ?
-        ''', (final_output, message_id))
-        cursor.execute('''
-            UPDATE sessions 
-            SET updated_at = CURRENT_TIMESTAMP
-            WHERE session_id = ?
-        ''', (session_id,))
-        conn.commit()
-        conn.close()
+        return final_output
     except Exception as e:
         print(f"UNEXPECTED ERROR in run_agent for message {message_id}: {str(e)}")
         print(f"Session: {session_id}, User input: {user_input[:100]}...")
         user_friendly_error = "I encountered an unexpected error while processing your request. Please try again later."
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE messages 
-            SET status = 'error', content = ?, completed_at = CURRENT_TIMESTAMP
-            WHERE message_id = ?
-        ''', (user_friendly_error, message_id))
-        cursor.execute('''
-            UPDATE sessions 
-            SET updated_at = CURRENT_TIMESTAMP
-            WHERE session_id = ?
-        ''', (session_id,))
-        conn.commit()
-        conn.close()
+        if use_db:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE messages 
+                SET status = 'error', content = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE message_id = ?
+            ''', (user_friendly_error, message_id))
+            cursor.execute('''
+                UPDATE sessions 
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            ''', (session_id,))
+            conn.commit()
+            conn.close()
+        return user_friendly_error

@@ -6,14 +6,15 @@ from .db import DB_PATH
 
 class SQLiteTracer(BaseCallbackHandler):
     """Tracer that stores events in SQLite database and limits tool usage"""
-    def __init__(self, message_id: str):
+    def __init__(self, message_id: str, db_path: str = None): # type: ignore
         self.message_id = message_id
         self.tool_usage_count = {}
         self.max_tool_calls = 3
+        self.db_path = db_path or DB_PATH
 
     def _write(self, record):
         record.update({"ts": time.time(), "message_id": self.message_id})
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO traces (message_id, event, data, timestamp)
@@ -70,11 +71,16 @@ class SQLiteTracer(BaseCallbackHandler):
     def on_tool_end(self, output, **kwargs):
         self._write({"event":"tool_end","output":output})
 
+    def on_agent_action(self, action, **kwargs):
+        print(f"Agent is thinking... Action: {action.log or 'No action specified'}")
+        print(action.log or 'No action specified')
+        self._write({"event":"reasoning","output":action.log or "Agent is thinking..."})
+
     def on_chain_start(self, serialized, inputs, **kwargs):
         name = None
         if serialized:
             name = serialized.get("id") or serialized.get("name")
         self._write({"event": "chain_start", "name": name, "inputs": inputs})
-        
+
     def on_chain_end(self, outputs, **kwargs):
         self._write({"event":"chain_end","outputs":outputs})
