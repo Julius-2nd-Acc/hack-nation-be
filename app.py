@@ -155,7 +155,6 @@ class SQLiteTracer(BaseCallbackHandler):
     # Tool events
     def on_tool_start(self, serialized, input_str, **kwargs):
         tool_name = serialized.get("name", "unknown_tool")
-        
         # Check if tool has been called too many times
         current_count = self.tool_usage_count.get(tool_name, 0)
         if current_count >= self.max_tool_calls:
@@ -174,7 +173,10 @@ class SQLiteTracer(BaseCallbackHandler):
 
     # Chain/agent events
     def on_chain_start(self, serialized, inputs, **kwargs):
-        self._write({"event":"chain_start","name":serialized.get("id") or serialized.get("name"),"inputs":inputs})
+        name = None
+        if serialized:
+            name = serialized.get("id") or serialized.get("name")
+        self._write({"event": "chain_start", "name": name, "inputs": inputs})
     
     def on_chain_end(self, outputs, **kwargs):
         self._write({"event":"chain_end","outputs":outputs})
@@ -249,14 +251,17 @@ def run_agent(session_id: str, message_id: str, user_input: str, conversation_co
         # Build context with conversation first, then current input, then system context
         current_date = datetime.now().strftime("%B %d, %Y")
         current_day = datetime.now().strftime("%A")
-        
+
+        now = datetime.now().astimezone()
+        current_time = now.strftime("%H:%M:%S %Z")
+
         # Put conversation context and user input FIRST (most important)
         main_context = conversation_context + user_input
         
         # Add system context at the end (supplementary)
         system_context = f"""
 
-[System Information - Current date: {current_day}, {current_date}]
+[System Information - Current date: {current_day}, {current_date}, Current system time: {current_time}]
 
 [Operating Guidelines: TEXT-ONLY environment]
 - Provide text-based responses only
