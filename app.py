@@ -174,7 +174,10 @@ class SQLiteTracer(BaseCallbackHandler):
 
     # Chain/agent events
     def on_chain_start(self, serialized, inputs, **kwargs):
-        self._write({"event":"chain_start","name":serialized.get("id") or serialized.get("name"),"inputs":inputs})
+        name = None
+        if serialized:
+            name = serialized.get("id") or serialized.get("name")
+        self._write({"event": "chain_start", "name": name, "inputs": inputs})
     
     def on_chain_end(self, outputs, **kwargs):
         self._write({"event":"chain_end","outputs":outputs})
